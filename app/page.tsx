@@ -1,65 +1,169 @@
-import Image from "next/image";
+"use client"
+
+import { useEffect, useRef, useState } from "react"
+
+let lastSent = 0
+let lastSpoken = ""
+
+type Landmark = { x: number; y: number; z: number }
+type HandLandmarks = Landmark[]
 
 export default function Home() {
+  const videoRef = useRef<HTMLVideoElement>(null)
+  const canvasRef = useRef<HTMLCanvasElement>(null)
+  const lastLandmarksRef = useRef<HandLandmarks | null>(null)
+
+  const [prediction, setPrediction] = useState("")
+
+  const saveGesture = async () => {
+    const landmarks = lastLandmarksRef.current
+    if (!landmarks) {
+      alert("No hand detected")
+      return
+    }
+
+    const name = prompt("Enter gesture name")
+    if (!name) return
+
+    await fetch("http://127.0.0.1:8000/train", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, landmarks }),
+    })
+
+    alert("Saved: " + name)
+  }
+
+  useEffect(() => {
+    if (!videoRef.current || !canvasRef.current) return
+    if (typeof window === "undefined") return
+
+    let camera: any
+    let hands: any
+    let mounted = true
+
+    const init = async () => {
+
+      const handsModule = await import("@mediapipe/hands")
+      const cameraModule = await import("@mediapipe/camera_utils")
+
+      const Hands = handsModule.Hands
+      const Camera = cameraModule.Camera
+
+      hands = new Hands({
+        locateFile: (file: string) =>
+          `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`,
+      })
+
+      hands.setOptions({
+        maxNumHands: 1,
+        modelComplexity: 1,
+        minDetectionConfidence: 0.7,
+        minTrackingConfidence: 0.7,
+      })
+
+      hands.onResults((results: any) => {
+        if (!mounted) return
+
+        const video = videoRef.current!
+        const canvas = canvasRef.current!
+        const ctx = canvas.getContext("2d")!
+
+        ctx.clearRect(0, 0, canvas.width, canvas.height)
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
+
+        if (!results.multiHandLandmarks?.length) return
+
+        const hand: HandLandmarks = results.multiHandLandmarks[0]
+        lastLandmarksRef.current = hand
+
+        hand.forEach((p) => {
+          ctx.beginPath()
+          ctx.arc(
+            p.x * canvas.width,
+            p.y * canvas.height,
+            5,
+            0,
+            Math.PI * 2
+          )
+          ctx.fillStyle = "lime"
+          ctx.fill()
+        })
+
+        const now = Date.now()
+        if (now - lastSent < 700) return
+        lastSent = now
+
+        fetch("http://127.0.0.1:8000/predict", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ landmarks: hand }),
+        })
+          .then((res) => res.json())
+          .then((data) => {
+            if (!mounted) return
+
+            setPrediction(data.gesture)
+
+            if (
+              data.gesture &&
+              data.gesture !== "UNKNOWN" &&
+              data.gesture !== lastSpoken
+            ) {
+              lastSpoken = data.gesture
+              speechSynthesis.speak(
+                new SpeechSynthesisUtterance(data.gesture)
+              )
+            }
+          })
+          .catch(console.error)
+      })
+
+      camera = new Camera(videoRef.current!, {
+        width: 640,
+        height: 480,
+        onFrame: async () => {
+          await hands.send({ image: videoRef.current! })
+        },
+      })
+
+      camera.start()
+    }
+
+    init()
+
+    return () => {
+      mounted = false
+      camera?.stop()
+      hands?.close()
+    }
+  }, [])
+
   return (
-    <div className="flex min-h-screen items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex min-h-screen w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
-      </main>
-    </div>
-  );
+    <main className="flex min-h-screen flex-col items-center justify-center bg-black">
+      <h1 className="text-white text-2xl mb-2">
+        ISL Instant Translator
+      </h1>
+
+      <h2 className="text-green-400 text-xl mb-2">
+        {prediction}
+      </h2>
+
+      <video ref={videoRef} className="hidden" />
+
+      <canvas
+        ref={canvasRef}
+        width={640}
+        height={480}
+        className="rounded-xl border border-gray-500"
+      />
+
+      <button
+        onClick={saveGesture}
+        className="mt-4 bg-green-500 px-4 py-2 rounded"
+      >
+        Save Gesture
+      </button>
+    </main>
+  )
 }
