@@ -1,14 +1,13 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from typing import List, Dict
+from pydantic import BaseModel
+from typing import List
 import numpy as np
+import json, os
 from sklearn.metrics.pairwise import cosine_similarity
+from collections import deque, Counter
 
-app = FastAPI(
-    title="ISL Instant Translator API",
-    version="1.0.0",
-)
+app = FastAPI(title="ISL Engine")
 
 app.add_middleware(
     CORSMiddleware,
@@ -17,9 +16,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-SIMILARITY_THRESHOLD = 0.92
-EXPECTED_LANDMARKS = 21 
-GESTURES: Dict[str, List[np.ndarray]] = {}
+DATA_FILE = "gestures.json"
+
+def load_db():
+    return json.load(open(DATA_FILE)) if os.path.exists(DATA_FILE) else {}
+
+def save_db(db):
+    json.dump(db, open(DATA_FILE, "w"))
+
+GESTURES = load_db()
+
+if "" in GESTURES:
+    del GESTURES[""]
+    save_db(GESTURES)
+
+PRED_WINDOW = deque(maxlen=7)
+CONF_THRESHOLD = 0.6
 
 
 class Landmark(BaseModel):
@@ -27,80 +39,76 @@ class Landmark(BaseModel):
     y: float
     z: float
 
-class LandmarkRequest(BaseModel):
-    landmarks: List[Landmark] = Field(..., min_items=EXPECTED_LANDMARKS)
+class PredictRequest(BaseModel):
+    landmarks: List[Landmark]
 
-class TrainRequest(LandmarkRequest):
-    name: str = Field(..., min_length=1, max_length=50)
+class BatchTrainRequest(BaseModel):
+    name: str
+    samples: List[List[Landmark]]
 
 def normalize_landmarks(landmarks: List[Landmark]) -> np.ndarray:
-    """
-    Converts landmarks into a normalized vector.
-    Uses wrist as origin to remove translation variance.
-    """
-    base_x = landmarks[0].x
-    base_y = landmarks[0].y
-
-    vector = []
-    for point in landmarks:
-        vector.extend([
-            point.x - base_x,
-            point.y - base_y,
-            point.z
-        ])
-
-    return np.array(vector, dtype=np.float32)
-
-def cosine_score(a: np.ndarray, b: np.ndarray) -> float:
-    return float(cosine_similarity([a], [b])[0][0])
-
-@app.get("/")
-def health_check():
-    return {"status": "API running"}
-
-@app.post("/train")
-def train_gesture(req: TrainRequest):
-    vector = normalize_landmarks(req.landmarks)
-
-    if req.name not in GESTURES:
-        GESTURES[req.name] = []
-
-    GESTURES[req.name].append(vector)
-
-    print(f"[TRAIN] {req.name} → samples: {len(GESTURES[req.name])}")
-
-    return {
-        "status": "saved",
-        "gesture": req.name,
-        "samples": len(GESTURES[req.name])
-    }
+    pts = np.array([[p.x, p.y, p.z] for p in landmarks])
+    pts -= pts[0]
+    scale = np.linalg.norm(pts[9])
+    if scale > 0:
+        pts /= scale
+    return pts.flatten()
 
 @app.post("/predict")
-def predict_gesture(req: LandmarkRequest):
+def predict(req: PredictRequest):
+    global PRED_WINDOW
 
     if not GESTURES:
-        return {"gesture": "NO_GESTURE"}
+        return {"prediction": None}
 
-    input_vector = normalize_landmarks(req.landmarks)
+    input_vec = normalize_landmarks(req.landmarks)
 
-    best_match = "UNKNOWN"
-    best_score = -1.0
+    best_label = None
+    best_score = -1
 
-    for gesture_name, samples in GESTURES.items():
-        avg_vector = np.mean(samples, axis=0)
-        score = cosine_score(input_vector, avg_vector)
+    for label, samples in GESTURES.items():
+        avg_vec = np.mean(np.array(samples), axis=0)
+
+        score = cosine_similarity(
+            input_vec.reshape(1, -1),
+            avg_vec.reshape(1, -1)
+        )[0][0]
 
         if score > best_score:
             best_score = score
-            best_match = gesture_name
+            best_label = label
 
-    if best_score < SIMILARITY_THRESHOLD:
-        return {
-            "gesture": "UNKNOWN",
-            "confidence": round(best_score * 100, 2)
-        }
+    if best_score < CONF_THRESHOLD:
+        return {"prediction": None}
+
+    PRED_WINDOW.append(best_label)
+    final_prediction = Counter(PRED_WINDOW).most_common(1)[0][0]
 
     return {
-        "gesture": best_match,
-        "confidence": round(best_score * 100, 2)
+        "prediction": final_prediction,
+        "confidence": round(best_score * 100, 2),
+        "window": list(PRED_WINDOW)
+    }
+
+
+@app.post("/train-batch")
+def train_batch(req: BatchTrainRequest):
+    name = req.name.strip().upper()
+    if not name:
+        return {"error": "INVALID_NAME"}
+
+    if name not in GESTURES:
+        GESTURES[name] = []
+
+    for s in req.samples:
+        GESTURES[name].append(normalize_landmarks(s).tolist())
+
+    save_db(GESTURES)
+    return {"status": "ok", "total": len(GESTURES[name])}
+
+@app.get("/gestures")
+def gesture_count():
+    return {
+        "count": len(GESTURES),
+        "names": list(GESTURES.keys())
     }

@@ -2,168 +2,252 @@
 
 import { useEffect, useRef, useState } from "react"
 
-let lastSent = 0
-let lastSpoken = ""
-
 type Landmark = { x: number; y: number; z: number }
-type HandLandmarks = Landmark[]
 
 export default function Home() {
   const videoRef = useRef<HTMLVideoElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
-  const lastLandmarksRef = useRef<HandLandmarks | null>(null)
+  const handsRef = useRef<any>(null)
 
-  const [prediction, setPrediction] = useState("")
+  const isTrainingRef = useRef(false)
+  const trainingSamplesRef = useRef<Landmark[][]>([])
+  const gestureNameRef = useRef("")
 
-  const saveGesture = async () => {
-    const landmarks = lastLandmarksRef.current
-    if (!landmarks) {
-      alert("No hand detected")
-      return
-    }
+  const currentSignRef = useRef<string | null>(null)
+  const stableCountRef = useRef(0)
+  const lastCommittedRef = useRef<string | null>(null)
 
-    const name = prompt("Enter gesture name")
-    if (!name) return
-
-    await fetch("http://127.0.0.1:8000/train", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name, landmarks }),
-    })
-
-    alert("Saved: " + name)
-  }
+  const [prediction, setPrediction] = useState("READY")
+  const [gestureName, setGestureName] = useState("")
+  const [gestureCount, setGestureCount] = useState(0)
+  const [status, setStatus] = useState("")
+  const [word, setWord] = useState("")
 
   useEffect(() => {
-    if (!videoRef.current || !canvasRef.current) return
-    if (typeof window === "undefined") return
-
-    let camera: any
-    let hands: any
-    let mounted = true
+    let active = true
+    let rafId = 0
 
     const init = async () => {
+      const mp = await import("@mediapipe/hands")
+      const Hands = mp.Hands
 
-      const handsModule = await import("@mediapipe/hands")
-      const cameraModule = await import("@mediapipe/camera_utils")
-
-      const Hands = handsModule.Hands
-      const Camera = cameraModule.Camera
-
-      hands = new Hands({
-        locateFile: (file: string) =>
-          `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`,
+      const hands = new Hands({
+        locateFile: (f) =>
+          `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`,
       })
 
       hands.setOptions({
         maxNumHands: 1,
         modelComplexity: 1,
-        minDetectionConfidence: 0.7,
-        minTrackingConfidence: 0.7,
+        minDetectionConfidence: 0.8,
+        minTrackingConfidence: 0.8,
       })
 
-      hands.onResults((results: any) => {
-        if (!mounted) return
+      hands.onResults((res: any) => {
+        if (!active || !canvasRef.current) return
 
-        const video = videoRef.current!
-        const canvas = canvasRef.current!
-        const ctx = canvas.getContext("2d")!
+        const ctx = canvasRef.current.getContext("2d")!
+        ctx.clearRect(0, 0, 640, 480)
+        ctx.drawImage(res.image, 0, 0, 640, 480)
 
-        ctx.clearRect(0, 0, canvas.width, canvas.height)
-        ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
+        if (!res.multiHandLandmarks?.length) return
+        const hand = res.multiHandLandmarks[0]
 
-        if (!results.multiHandLandmarks?.length) return
-
-        const hand: HandLandmarks = results.multiHandLandmarks[0]
-        lastLandmarksRef.current = hand
-
-        hand.forEach((p) => {
+        hand.forEach((p: Landmark) => {
           ctx.beginPath()
-          ctx.arc(
-            p.x * canvas.width,
-            p.y * canvas.height,
-            5,
-            0,
-            Math.PI * 2
-          )
-          ctx.fillStyle = "lime"
+          ctx.arc(p.x * 640, p.y * 480, 4, 0, Math.PI * 2)
+          ctx.fillStyle = "#22c55e"
           ctx.fill()
         })
 
-        const now = Date.now()
-        if (now - lastSent < 700) return
-        lastSent = now
+        if (isTrainingRef.current) {
+          trainingSamplesRef.current.push(hand)
+          setPrediction(
+            `TRAINING ${trainingSamplesRef.current.length}/30`
+          )
 
-        fetch("http://127.0.0.1:8000/predict", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ landmarks: hand }),
-        })
-          .then((res) => res.json())
-          .then((data) => {
-            if (!mounted) return
+          if (trainingSamplesRef.current.length >= 30) {
+            finishTraining()
+          }
+          return
+        }
 
-            setPrediction(data.gesture)
-
-            if (
-              data.gesture &&
-              data.gesture !== "UNKNOWN" &&
-              data.gesture !== lastSpoken
-            ) {
-              lastSpoken = data.gesture
-              speechSynthesis.speak(
-                new SpeechSynthesisUtterance(data.gesture)
-              )
-            }
-          })
-          .catch(console.error)
+        predict(hand)
       })
 
-      camera = new Camera(videoRef.current!, {
-        width: 640,
-        height: 480,
-        onFrame: async () => {
-          await hands.send({ image: videoRef.current! })
-        },
-      })
+      handsRef.current = hands
+      startCamera()
+    }
 
-      camera.start()
+    const startCamera = async () => {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true })
+      videoRef.current!.srcObject = stream
+      await videoRef.current!.play()
+
+      const loop = async () => {
+        if (!active) return
+        await handsRef.current.send({ image: videoRef.current })
+        rafId = requestAnimationFrame(loop)
+      }
+      loop()
     }
 
     init()
+    loadGestures()
 
     return () => {
-      mounted = false
-      camera?.stop()
-      hands?.close()
+      active = false
+      cancelAnimationFrame(rafId)
+      handsRef.current?.close()
     }
   }, [])
 
-  return (
-    <main className="flex min-h-screen flex-col items-center justify-center bg-black">
-      <h1 className="text-white text-2xl mb-2">
-        ISL Instant Translator
-      </h1>
+  const predict = async (landmarks: Landmark[]) => {
+    try {
+      const r = await fetch("http://127.0.0.1:8000/predict", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ landmarks }),
+      })
 
-      <h2 className="text-green-400 text-xl mb-2">
-        {prediction}
-      </h2>
+      const d = await r.json()
+      if (!d.prediction) {
+        setPrediction("—")
+        return
+      }
+
+      setPrediction(d.prediction)
+
+      if (d.prediction === currentSignRef.current) {
+        stableCountRef.current += 1
+      } else {
+        currentSignRef.current = d.prediction
+        stableCountRef.current = 1
+      }
+
+      if (
+        stableCountRef.current >= 3 &&
+        d.prediction !== lastCommittedRef.current
+      ) {
+        setWord((w) => w + d.prediction)
+        lastCommittedRef.current = d.prediction
+      }
+    } catch {
+      setPrediction("BACKEND OFFLINE")
+    }
+  }
+
+  const finishTraining = async () => {
+    isTrainingRef.current = false
+
+    const name = gestureNameRef.current.trim().toUpperCase()
+    if (!name) {
+      setStatus("❌ INVALID NAME")
+      return
+    }
+
+    await fetch("http://127.0.0.1:8000/train-batch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name,
+        samples: trainingSamplesRef.current,
+      }),
+    })
+
+    trainingSamplesRef.current = []
+    setGestureName("")
+    setPrediction("READY")
+    setStatus(`✅ SAVED: ${name}`)
+
+    loadGestures()
+  }
+
+  const loadGestures = async () => {
+    const r = await fetch("http://127.0.0.1:8000/gestures")
+    const d = await r.json()
+    setGestureCount(d.count)
+  }
+
+  return (
+    <main className="min-h-screen bg-black flex flex-col items-center justify-center text-white px-4">
+
+      <h1 className="text-3xl font-bold mb-1">ISL Translator</h1>
+
+      <div className="mb-4 text-center">
+        <div className="text-xs tracking-[0.4em] text-green-400">
+          LIVE WORD
+        </div>
+        <div className="
+          mt-2 px-6 py-4 min-h-[64px]
+          rounded-2xl
+          bg-green-500/10
+          border border-green-500/30
+          shadow-[0_0_40px_rgba(34,197,94,0.25)]
+        ">
+          <span className="text-4xl font-bold tracking-widest text-green-300">
+            {word || "—"}
+          </span>
+        </div>
+      </div>
+
+      <p className="text-green-400 text-xl">{prediction}</p>
+      <p className="text-sm text-gray-400 mb-3">
+        READY ({gestureCount} SIGNS)
+      </p>
 
       <video ref={videoRef} className="hidden" />
-
       <canvas
         ref={canvasRef}
         width={640}
         height={480}
-        className="rounded-xl border border-gray-500"
+        className="
+          rounded-2xl
+          border border-green-500/30
+          shadow-[0_0_60px_rgba(34,197,94,0.25)]
+        "
+      />
+
+      <input
+        value={gestureName}
+        onChange={(e) => {
+          setGestureName(e.target.value)
+          gestureNameRef.current = e.target.value
+        }}
+        placeholder="Gesture name (A, B, HELLO)"
+        className="
+          mt-5 w-full max-w-md
+          px-4 py-3
+          text-lg text-white
+          bg-gray-900
+          border border-gray-700
+          rounded-lg
+          focus:outline-none focus:border-green-500
+        "
       />
 
       <button
-        onClick={saveGesture}
-        className="mt-4 bg-green-500 px-4 py-2 rounded"
+        onClick={() => {
+          if (!gestureName.trim()) {
+            setStatus("❌ ENTER GESTURE NAME")
+            return
+          }
+          trainingSamplesRef.current = []
+          isTrainingRef.current = true
+          setStatus("🎥 CAPTURING...")
+        }}
+        className="
+          mt-3 bg-green-600 hover:bg-green-700
+          px-6 py-3 rounded-lg
+          text-lg font-semibold
+        "
       >
-        Save Gesture
+        Capture Gesture
       </button>
+
+      {status && (
+        <p className="mt-3 text-sm text-yellow-400">{status}</p>
+      )}
     </main>
   )
 }
